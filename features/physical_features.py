@@ -1,164 +1,160 @@
 """
 physical_features.py
 ---------------------
-Extracts physical fatigue signals from player tracking data.
+Derives physical fatigue proxies from StatsBomb EVENT data only.
+(No tracking data required.)
 
-Features computed per player per rolling window:
-    - sprint_count          : # velocity bursts above threshold
-    - sprint_rate           : sprints per minute
-    - mean_velocity         : avg speed in window
-    - max_velocity          : peak speed in window
-    - distance_covered      : total metres in window
-    - hi_effort_ratio       : fraction of frames above high-intensity threshold
-    - accel_load            : RMS acceleration (neuromuscular load proxy)
-    - cod_count             : direction changes above angle threshold
-    - heatmap_drift         : std dev of position from player's mean position
-    - fatigue_index         : rolling velocity decline slope (+ = slowing down)
+Since StatsBomb open data has no raw tracking, we approximate physical
+load from event-level signals available in the data:
+
+Features per player per rolling window:
+    - event_rate          : total events per minute (activity proxy)
+    - carry_rate          : carries per minute (physical load proxy)
+    - duel_rate           : duels per minute (contact/exertion proxy)
+    - press_rate          : pressures per minute (high-intensity proxy)
+    - distance_proxy      : sum of pass lengths in window (if available)
+    - action_density      : events in window / window duration
+    - position_spread_x   : std dev of x locations (spatial range)
+    - position_spread_y   : std dev of y locations
+    - avg_x               : mean x position (pitch zone)
+    - avg_y               : mean y position
+    - fatigue_index       : decline in event rate vs player's own 1st-half avg
 """
 
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter
 
 
-# ─── Thresholds (m/s) ────────────────────────────────────────────────────────
-SPRINT_THRESHOLD_MS      = 7.0   # ~25 km/h
-HIGH_INTENSITY_THRESHOLD = 5.0   # ~18 km/h
-COD_ANGLE_THRESHOLD_DEG  = 45    # minimum bearing change for a direction-change event
+SHORT_WINDOW_S = 60     # 1 minute
+LONG_WINDOW_S  = 300    # 5 minutes
 
-# ─── Window sizes (seconds) ───────────────────────────────────────────────────
-SHORT_WINDOW_S  = 60    # 1 minute
-LONG_WINDOW_S   = 300   # 5 minutes
-
-
-def _compute_bearing(vx: np.ndarray, vy: np.ndarray) -> np.ndarray:
-    """Direction of travel in degrees [0, 360)."""
-    return np.degrees(np.arctan2(vy, vx)) % 360
+HIGH_INTENSITY_TYPES = {
+    "Pressure", "Duel", "Carry", "Ball Recovery",
+    "Clearance", "Block", "Interception",
+}
 
 
-def _angular_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Smallest angle between two bearing arrays."""
-    diff = np.abs(a - b) % 360
-    return np.minimum(diff, 360 - diff)
+def _window_physical(window_df: pd.DataFrame, window_seconds: int) -> dict:
+    """Compute physical proxy features for one player time window."""
+    if window_df.empty:
+        return {}
+
+    total        = len(window_df)
+    window_mins  = window_seconds / 60.0
+
+    event_rate   = total / window_mins
+
+    carry_rate   = window_df["event_type"].eq("Carry").sum()       / window_mins
+    duel_rate    = window_df["event_type"].eq("Duel").sum()        / window_mins
+    press_rate   = window_df["event_type"].eq("Pressure").sum()    / window_mins
+    hi_rate      = window_df["event_type"].isin(HIGH_INTENSITY_TYPES).sum() / window_mins
+
+    # Spatial spread from location data
+    locs = window_df.dropna(subset=["x", "y"])
+    position_spread_x = float(locs["x"].std()) if len(locs) > 1 else 0.0
+    position_spread_y = float(locs["y"].std()) if len(locs) > 1 else 0.0
+    avg_x = float(locs["x"].mean()) if not locs.empty else np.nan
+    avg_y = float(locs["y"].mean()) if not locs.empty else np.nan
+
+    # Pass length sum as distance proxy
+    if "pass_length" in window_df.columns:
+        distance_proxy = float(window_df["pass_length"].sum())
+    else:
+        distance_proxy = np.nan
+
+    return {
+        "event_rate":         round(event_rate,         4),
+        "carry_rate":         round(carry_rate,         4),
+        "duel_rate":          round(duel_rate,          4),
+        "press_rate":         round(press_rate,         4),
+        "hi_intensity_rate":  round(hi_rate,            4),
+        "distance_proxy":     round(distance_proxy, 2) if not np.isnan(distance_proxy) else np.nan,
+        "position_spread_x":  round(position_spread_x, 4),
+        "position_spread_y":  round(position_spread_y, 4),
+        "avg_x":              round(avg_x, 3) if not np.isnan(avg_x) else np.nan,
+        "avg_y":              round(avg_y, 3) if not np.isnan(avg_y) else np.nan,
+    }
 
 
 def extract_physical_features(
-    tracking_df: pd.DataFrame,
+    events_df:      pd.DataFrame,
     window_seconds: int = SHORT_WINDOW_S,
-    sample_rate_hz: int = 10,
+    step_seconds:   int = 30,
 ) -> pd.DataFrame:
     """
-    Compute rolling physical fatigue features for every player.
+    Slide a time window over each player's event stream and compute
+    physical proxy features.
 
     Parameters
     ----------
-    tracking_df  : DataFrame with columns [player_id, timestamp, x, y,
-                   velocity, acceleration, vx, vy]
-    window_seconds : rolling window size in seconds
-    sample_rate_hz : tracking sample rate
+    events_df      : cleaned events DataFrame from data_loader.load_events
+    window_seconds : rolling window width in seconds
+    step_seconds   : slide step in seconds
 
     Returns
     -------
-    DataFrame indexed by (player_id, window_end_timestamp) with feature columns.
+    DataFrame with (player_id, window_end_ts, feature...) rows.
     """
-    window_frames = window_seconds * sample_rate_hz
-    records = []
+    records  = []
+    max_time = float(events_df["time_seconds"].max())
+    players  = events_df["player_id"].dropna().unique()
 
-    for player_id, group in tracking_df.groupby("player_id"):
-        group = group.sort_values("timestamp").reset_index(drop=True)
-        n = len(group)
+    # Per-player first-half event rate (baseline for fatigue_index)
+    first_half = events_df[events_df["period"] == 1]
+    first_half_duration = float(first_half["time_seconds"].max()) or 2700.0
+    baseline_rates: dict[float, float] = {}
+    for pid in players:
+        p_fh = first_half[first_half["player_id"] == pid]
+        baseline_rates[float(pid)] = len(p_fh) / (first_half_duration / 60.0)
 
-        vel   = np.array(group["velocity"].values,     dtype=np.float64)
-        accel = np.array(group["acceleration"].values, dtype=np.float64)
-        x     = np.array(group["x"].values,            dtype=np.float64)
-        y     = np.array(group["y"].values,            dtype=np.float64)
-        vx    = np.array(group["vx"].values,           dtype=np.float64)
-        vy    = np.array(group["vy"].values,           dtype=np.float64)
-        ts    = np.array(group["timestamp"].values,    dtype=np.float64)
+    for player_id in players:
+        pid_f    = float(player_id)
+        p_events = events_df[events_df["player_id"] == player_id].sort_values("time_seconds")
+        baseline = baseline_rates.get(pid_f, 1.0)
 
-        # Smooth velocity for slope estimation
-        vel_smooth = savgol_filter(vel, window_length=min(51, n if n % 2 == 1 else n - 1), polyorder=2) \
-            if n > 51 else vel.copy()
+        for window_end in np.arange(window_seconds, max_time + step_seconds, step_seconds):
+            window_start = window_end - window_seconds
+            window_df    = p_events[
+                (p_events["time_seconds"] >= window_start) &
+                (p_events["time_seconds"] <  window_end)
+            ]
 
-        bearing = _compute_bearing(vx, vy)
+            feats = _window_physical(window_df, window_seconds)
+            if not feats:
+                continue
 
-        step = max(1, window_frames // 10)   # slide every 10% of window
-
-        for end in range(window_frames, n, step):
-            start = end - window_frames
-            w_vel   = vel[start:end]
-            w_accel = accel[start:end]
-            w_x     = x[start:end]
-            w_y     = y[start:end]
-            w_bear  = bearing[start:end]
-            w_smooth= vel_smooth[start:end]
-
-            # Sprint detection
-            is_sprint = w_vel >= SPRINT_THRESHOLD_MS
-            sprint_transitions = np.diff(is_sprint.astype(int))
-            sprint_count = int(np.sum(sprint_transitions == 1))
-
-            # Hi-intensity ratio
-            hi_effort_ratio = float(np.mean(w_vel >= HIGH_INTENSITY_THRESHOLD))
-
-            # Distance (velocity × dt)
-            dt = 1.0 / sample_rate_hz
-            distance_covered = float(np.sum(w_vel) * dt)
-
-            # Acceleration load (RMS)
-            accel_load = float(np.sqrt(np.mean(w_accel ** 2)))
-
-            # Change-of-direction count
-            bear_diff = _angular_diff(w_bear[:-1], w_bear[1:])
-            cod_count = int(np.sum(bear_diff >= COD_ANGLE_THRESHOLD_DEG))
-
-            # Heatmap drift (spatial spread)
-            heatmap_drift = float(np.std(w_x) + np.std(w_y))
-
-            # Fatigue index: slope of smoothed velocity (positive = declining)
-            slope = np.polyfit(np.arange(len(w_smooth)), w_smooth, 1)[0]
-            fatigue_index = float(-slope)  # positive when slowing
-
-            window_minutes = window_seconds / 60.0
-            sprint_rate = sprint_count / window_minutes
+            # Fatigue index: how much has event rate dropped vs first-half baseline
+            fatigue_index = float(baseline - feats["event_rate"]) / max(baseline, 1.0)
 
             records.append({
-                "player_id":        player_id,
-                "window_end_ts":    float(ts[end - 1]),
-                "window_seconds":   window_seconds,
-                "sprint_count":     sprint_count,
-                "sprint_rate":      round(sprint_rate, 4),
-                "mean_velocity":    round(float(np.mean(w_vel)), 4),
-                "max_velocity":     round(float(w_vel.max()), 4),
-                "distance_covered": round(distance_covered, 2),
-                "hi_effort_ratio":  round(hi_effort_ratio, 4),
-                "accel_load":       round(accel_load, 4),
-                "cod_count":        cod_count,
-                "heatmap_drift":    round(heatmap_drift, 4),
-                "fatigue_index":    round(fatigue_index, 6),
+                "player_id":      float(player_id),
+                "window_end_ts":  float(window_end),
+                "window_seconds": window_seconds,
+                "fatigue_index":  round(fatigue_index, 4),
+                **feats,
             })
 
     return pd.DataFrame(records)
 
 
 def compute_dual_window_features(
-    tracking_df: pd.DataFrame,
-    sample_rate_hz: int = 10,
+    events_df:      pd.DataFrame,
+    sample_rate_hz: int = 10,   # kept for API compat, unused
 ) -> pd.DataFrame:
     """
-    Compute both short (1-min) and long (5-min) window features
-    and merge them into a single wide DataFrame.
+    Compute short (1-min) and long (5-min) physical features and merge.
     """
-    short = extract_physical_features(tracking_df, SHORT_WINDOW_S, sample_rate_hz)
-    long_ = extract_physical_features(tracking_df, LONG_WINDOW_S, sample_rate_hz)
+    short = extract_physical_features(events_df, SHORT_WINDOW_S, step_seconds=30)
+    long_ = extract_physical_features(events_df, LONG_WINDOW_S,  step_seconds=60)
 
     short = short.drop(columns=["window_seconds"])
     long_ = long_.drop(columns=["window_seconds"])
 
-    short = short.rename(columns={c: f"{c}_1m" for c in short.columns
-                                   if c not in ("player_id", "window_end_ts")})
-    long_ = long_.rename(columns={c: f"{c}_5m" for c in long_.columns
-                                   if c not in ("player_id", "window_end_ts")})
+    suffix_cols_s = [c for c in short.columns if c not in ("player_id", "window_end_ts")]
+    suffix_cols_l = [c for c in long_.columns  if c not in ("player_id", "window_end_ts")]
+
+    short = short.rename(columns={c: f"{c}_1m" for c in suffix_cols_s})
+    long_ = long_.rename(columns={c: f"{c}_5m" for c in suffix_cols_l})
 
     merged = pd.merge_asof(
         short.sort_values("window_end_ts"),
@@ -170,18 +166,14 @@ def compute_dual_window_features(
     return merged
 
 
-# ─── Quick test ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    from data.data_loader import generate_synthetic_tracking
+    import sys, os
+    sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
+    from data.data_loader import load_events
 
-    tracking = generate_synthetic_tracking(
-        match_id=1, player_ids=[101, 102, 103], duration_seconds=600
-    )
-    print("Tracking sample:")
-    print(tracking.head(3))
+    events = load_events(3773386)
+    print("Events loaded:", events.shape)
 
-    features = compute_dual_window_features(tracking)
-    print("\nPhysical features sample:")
-    print(features.head(3))
-    print("Shape:", features.shape)
-    print("Columns:", features.columns.tolist())
+    features = compute_dual_window_features(events)
+    print("Physical features shape:", features.shape)
+    print(features.dropna().head(5).to_string())

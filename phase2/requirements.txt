@@ -1,0 +1,6 @@
+# ML
+scikit-learn>=1.4.0
+torch>=2.2.0
+
+# Plotting
+matplotlib>=3.8.0

@@ -1,35 +1,32 @@
 """
 labeler.py
 -----------
-Labels "performance drop" windows for each player.
+Labels "performance drop" windows for each player using
+real StatsBomb event data features only (no tracking required).
 
-A drop is flagged when any of the following cross their thresholds
-within a rolling window compared to the player's own recent baseline:
+Signals used:
+    From cognitive_features : pass_accuracy_1m, error_rate_1m, decision_latency_mean_1m
+    From physical_features  : hi_intensity_rate_1m, fatigue_index_1m, event_rate_1m
 
-    1. Pass accuracy z-score drops below  -ZSCORE_THRESH
-    2. Error rate z-score rises above     +ZSCORE_THRESH
-    3. Sprint rate z-score drops below    -ZSCORE_THRESH
-    4. Combined composite score < -COMPOSITE_THRESH
+A drop is flagged when per-player rolling z-scores cross thresholds,
+or when the composite fatigue score exceeds COMPOSITE_THRESH.
 
-The label is BINARY:
-    1 = performance drop occurred in this window
-    0 = no drop
-
-Additionally a soft RISK_SCORE (0-1) is produced for regression targets.
+Labels:
+    drop_label  (int  0/1) - drop occurring in this window
+    future_drop (int  0/1) - drop occurring in next N windows
+    risk_score  (float 0-1) - sigmoid of composite z-score
 """
 
 import numpy as np
 import pandas as pd
 
 
-# ─── Thresholds ───────────────────────────────────────────────────────────────
-ZSCORE_THRESH     = 1.5    # standard deviations from player's rolling mean
-COMPOSITE_THRESH  = 1.0    # composite z-score threshold
-BASELINE_WINDOW   = 5      # number of prior windows used to build baseline
+ZSCORE_THRESH    = 1.5
+COMPOSITE_THRESH = 1.0
+BASELINE_WINDOW  = 5
 
 
 def _rolling_zscore(series: pd.Series, window: int = BASELINE_WINDOW) -> pd.Series:
-    """Compute z-score relative to rolling mean and std."""
     roll_mean = series.rolling(window, min_periods=2).mean()
     roll_std  = series.rolling(window, min_periods=2).std().replace(0, np.nan)
     return (series - roll_mean) / roll_std
@@ -43,27 +40,13 @@ def label_performance_drops(
     baseline_window:  int   = BASELINE_WINDOW,
 ) -> pd.DataFrame:
     """
-    Merge cognitive and physical feature DataFrames and produce drop labels.
-
-    Parameters
-    ----------
-    cognitive_df : output of cognitive_features.compute_dual_window_cognitive
-    physical_df  : output of physical_features.compute_dual_window_features
-    zscore_thresh    : z-score threshold for individual signals
-    composite_thresh : threshold on composite fatigue score
-    baseline_window  : rolling baseline window (number of time steps)
-
-    Returns
-    -------
-    DataFrame with all features + columns:
-        drop_label   (int  0/1)
-        risk_score   (float 0-1)
-        z_pass_acc   z_error_rate   z_sprint_rate   composite_z
+    Merge cognitive + physical feature DataFrames and produce drop labels.
+    Uses only event-derived features (no tracking/sprint data).
     """
 
-    # ── Merge on player + nearest timestamp ──────────────────────────────────
-    cog = cognitive_df.sort_values(["player_id", "window_end_ts"]).copy()
-    phy = physical_df.sort_values(["player_id", "window_end_ts"]).copy()
+    # merge_asof requires global sort on the key column
+    cog = cognitive_df.sort_values("window_end_ts").copy()
+    phy = physical_df.sort_values("window_end_ts").copy()
 
     merged = pd.merge_asof(
         cog,
@@ -71,79 +54,75 @@ def label_performance_drops(
         on="window_end_ts",
         by="player_id",
         direction="nearest",
-        tolerance=60,    # allow up to 60s mismatch between windows
+        tolerance=60,
     )
 
-    # ── Per-player rolling z-scores ───────────────────────────────────────────
     merged = merged.sort_values(["player_id", "window_end_ts"])
 
-    for player_id, grp_idx in merged.groupby("player_id").groups.items():
-        grp = merged.loc[grp_idx]
+    # ── Per-player rolling z-scores ───────────────────────────────────────────
+    # Map each signal to its column name and drop direction
+    # (True = higher value = worse performance)
+    signal_map = {
+        "z_pass_acc":      ("pass_accuracy_1m",         False),  # lower = worse
+        "z_error_rate":    ("error_rate_1m",             True),   # higher = worse
+        "z_latency":       ("decision_latency_mean_1m",  True),   # higher = worse
+        "z_hi_intensity":  ("hi_intensity_rate_1m",      False),  # lower = worse
+        "z_fatigue_idx":   ("fatigue_index_1m",          True),   # higher = worse
+    }
 
-        # Pass accuracy (lower is worse → negative z = drop)
-        if "pass_accuracy_1m" in merged.columns:
-            merged.loc[grp_idx, "z_pass_acc"] = _rolling_zscore(
-                grp["pass_accuracy_1m"], baseline_window
-            ).values
+    for z_col, (src_col, higher_is_worse) in signal_map.items():
+        if src_col not in merged.columns:
+            merged[z_col] = 0.0
+            continue
+        for player_id, grp_idx in merged.groupby("player_id").groups.items():
+            grp = merged.loc[grp_idx]
+            z   = _rolling_zscore(grp[src_col], baseline_window)
+            merged.loc[grp_idx, z_col] = z.values
 
-        # Error rate (higher is worse → positive z = drop)
-        if "error_rate_1m" in merged.columns:
-            merged.loc[grp_idx, "z_error_rate"] = _rolling_zscore(
-                grp["error_rate_1m"], baseline_window
-            ).values
-
-        # Sprint rate (lower is worse → negative z = fatigue)
-        if "sprint_rate_1m" in merged.columns:
-            merged.loc[grp_idx, "z_sprint_rate"] = _rolling_zscore(
-                grp["sprint_rate_1m"], baseline_window
-            ).values
-
-    # Fill NaN z-scores with 0 (no signal yet)
-    for col in ["z_pass_acc", "z_error_rate", "z_sprint_rate"]:
-        if col not in merged.columns:
-            merged[col] = 0.0
-        merged[col] = merged[col].fillna(0.0)
+    for z_col in signal_map:
+        if z_col not in merged.columns:
+            merged[z_col] = 0.0
+        merged[z_col] = merged[z_col].fillna(0.0)
 
     # ── Composite z-score ─────────────────────────────────────────────────────
-    # Sign convention: positive composite = evidence of drop
+    # Positive composite = evidence of performance drop
     merged["composite_z"] = (
-        -merged["z_pass_acc"]      # declining pass acc → positive
-        + merged["z_error_rate"]   # rising error rate  → positive
-        - merged["z_sprint_rate"]  # declining sprint   → positive
-    ) / 3.0
+        -merged["z_pass_acc"]       # declining pass acc  -> positive
+        + merged["z_error_rate"]    # rising error rate   -> positive
+        + merged["z_latency"]       # rising latency      -> positive
+        - merged["z_hi_intensity"]  # declining intensity -> positive
+        + merged["z_fatigue_idx"]   # rising fatigue idx  -> positive
+    ) / 5.0
 
-    # ── Binary label ─────────────────────────────────────────────────────────
-    drop_pass    = merged["z_pass_acc"]   < -zscore_thresh
-    drop_errors  = merged["z_error_rate"] >  zscore_thresh
-    drop_sprint  = merged["z_sprint_rate"]< -zscore_thresh
-    drop_composite = merged["composite_z"] > composite_thresh
+    # ── Binary label ──────────────────────────────────────────────────────────
+    drop_pass      = merged["z_pass_acc"]      < -zscore_thresh
+    drop_errors    = merged["z_error_rate"]    >  zscore_thresh
+    drop_latency   = merged["z_latency"]       >  zscore_thresh
+    drop_intensity = merged["z_hi_intensity"]  < -zscore_thresh
+    drop_composite = merged["composite_z"]     >  composite_thresh
 
     merged["drop_label"] = (
-        (drop_pass | drop_errors | drop_sprint | drop_composite)
+        drop_pass | drop_errors | drop_latency | drop_intensity | drop_composite
     ).astype(int)
 
-    # ── Soft risk score (sigmoid of composite_z) ─────────────────────────────
+    # ── Soft risk score ───────────────────────────────────────────────────────
     merged["risk_score"] = 1 / (1 + np.exp(-merged["composite_z"]))
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
     n_total = len(merged)
-    n_drops = merged["drop_label"].sum()
+    n_drops = int(merged["drop_label"].sum())
     print(f"[Labeler] Total windows: {n_total} | Drops: {n_drops} "
-          f"({100*n_drops/max(n_total,1):.1f}%)")
+          f"({100 * n_drops / max(n_total, 1):.1f}%)")
 
     return merged.reset_index(drop=True)
 
 
 def forward_label(
-    labeled_df: pd.DataFrame,
+    labeled_df:      pd.DataFrame,
     lookahead_steps: int = 3,
 ) -> pd.DataFrame:
     """
-    Create a FUTURE drop label: 1 if a drop occurs within the next
-    `lookahead_steps` windows (used for predictive modelling).
-
-    This shifts drop_label backwards so that earlier windows can be
-    trained to predict upcoming drops.
+    Shift drop_label back by lookahead_steps so earlier windows
+    can be trained to predict upcoming drops.
     """
     df = labeled_df.sort_values(["player_id", "window_end_ts"]).copy()
 
@@ -157,27 +136,19 @@ def forward_label(
     return df
 
 
-# ─── Quick test ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-    from data.data_loader import load_events, generate_synthetic_tracking
-    from features.cognitive_features import compute_dual_window_cognitive
+    from data.data_loader            import load_events
     from features.physical_features  import compute_dual_window_features
+    from features.cognitive_features import compute_dual_window_cognitive
 
-    MATCH_ID = 3788741   # StatsBomb open — Women's World Cup
-    events   = load_events(MATCH_ID)
-    player_ids = events["player_id"].dropna().unique().tolist()
-    tracking = generate_synthetic_tracking(MATCH_ID, player_ids, duration_seconds=600)
-
-    cog = compute_dual_window_cognitive(events)
-    phy = compute_dual_window_features(tracking)
-
+    events  = load_events(3773386)
+    phy     = compute_dual_window_features(events)
+    cog     = compute_dual_window_cognitive(events)
     labeled = label_performance_drops(cog, phy)
     labeled = forward_label(labeled)
 
-    print("\nLabeled sample:")
     print(labeled[["player_id", "window_end_ts", "composite_z",
                    "drop_label", "future_drop", "risk_score"]].head(10).to_string())
-    print("\nFuture drop rate:", labeled["future_drop"].mean())
+    print("Future drop rate:", labeled["future_drop"].mean())

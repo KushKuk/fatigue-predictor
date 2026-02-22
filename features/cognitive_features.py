@@ -195,8 +195,8 @@ if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
     from data.data_loader import load_events
 
-    # Use match 3788741 (StatsBomb open data — Women's World Cup)
-    events = load_events(3788741)
+    # Use match 3773386 (StatsBomb open data — Women's World Cup)
+    events = load_events(3773386)
     print("Events loaded:", events.shape)
     print(events["event_type"].value_counts().head(10))
 
