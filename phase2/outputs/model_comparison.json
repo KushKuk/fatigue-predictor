@@ -12,13 +12,13 @@
   },
   {
     "name": "LSTM",
-    "auc": 0.7251,
-    "avg_precision": 0.5446,
-    "f1": 0.4964,
-    "precision": 0.4404,
-    "recall": 0.5686,
-    "brier": 0.2023,
+    "auc": 0.7276,
+    "avg_precision": 0.5478,
+    "f1": 0.4952,
+    "precision": 0.4513,
+    "recall": 0.5486,
+    "brier": 0.1967,
     "threshold": 0.5,
-    "early_detection_rate": 0.5977
+    "early_detection_rate": 0.5885
   }
 ]

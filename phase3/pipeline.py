@@ -53,7 +53,7 @@ from evaluation.evaluator import (
 )
 
 DEFAULT_PARQUET = os.path.join(
-    ROOT_DIR, "phase1", "outputs", "phase1_features_match3773386.parquet"
+    ROOT_DIR, "phase1", "outputs", "phase1_all_matches.parquet"
 )
 DEFAULT_OUT = os.path.join(BASE_DIR, "outputs")
 
@@ -114,7 +114,7 @@ def run_pipeline(
     # Warn if dataset is likely too small for a Transformer to shine
     n_train_players = np.unique(ds.player_ids_train).size
     if n_train_players < 50:
-        log(f"⚠  Only {n_train_players} training players — Transformer may underperform "
+        log(f"Only {n_train_players} training players — Transformer may underperform "
             f"vs simpler baselines.  Aim for 100+ players for best results.")
 
     # ── 2. Hyperparameter search (optional) ───────────────────────────────────
@@ -179,7 +179,7 @@ def run_pipeline(
     n_seqs = _loader_len(train_loader)
     ratio  = n_params / max(n_seqs, 1)
     if ratio > 100:
-        log(f"⚠  {n_params:,} params / {n_seqs} sequences = {ratio:.0f}× ratio. "
+        log(f"⚠  {n_params:,} params / {n_seqs} sequences = {ratio:.0f}x ratio. "
             f"High overfitting risk — consider smaller d_model/n_layers or more data.")
 
     # ── 5. Train ──────────────────────────────────────────────────────────────
@@ -286,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--survival",   action="store_true", help="Add survival head")
     parser.add_argument("--shap",       action="store_true", help="Compute SHAP values")
     parser.add_argument("--epochs",     type=int,  default=80)
-    parser.add_argument("--device",     type=str,  default="cpu")
+    parser.add_argument("--device",     type=str,  default="cuda")
     parser.add_argument("--d_model",    type=int,  default=DEFAULT_HP["d_model"])
     parser.add_argument("--n_heads",    type=int,  default=DEFAULT_HP["n_heads"])
     parser.add_argument("--n_layers",   type=int,  default=DEFAULT_HP["n_layers"])

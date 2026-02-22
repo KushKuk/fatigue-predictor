@@ -1,0 +1,5 @@
+# Dashboard
+streamlit>=1.32.0
+
+# Alerting (webhook support)
+urllib3>=2.0.0

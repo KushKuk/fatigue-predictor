@@ -29,7 +29,7 @@ ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, BASE_DIR)
 
-DEFAULT_PARQUET = os.path.join(ROOT_DIR, "phase1", "outputs", "phase1_features_match3773386.parquet")
+DEFAULT_PARQUET = os.path.join(ROOT_DIR, "phase1", "outputs", "phase1_all_matches.parquet")
 DEFAULT_OUT     = os.path.join(BASE_DIR, "outputs")
 
 from data.dataset                 import load_dataset
@@ -163,7 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--seq_len",     type=int, default=10)
     parser.add_argument("--batch_size",  type=int, default=64)
     parser.add_argument("--lstm_epochs", type=int, default=50)
-    parser.add_argument("--device",      type=str, default="cpu")
+    parser.add_argument("--device",      type=str, default="cuda")
     parser.add_argument("--quiet",       action="store_true")
     args = parser.parse_args()
 

@@ -87,8 +87,8 @@ class FatigueDataset:
         tr = set(self.player_ids_train.tolist())
         va = set(self.player_ids_val.tolist())
         te = set(self.player_ids_test.tolist())
-        print(f"  Player overlap   : train∩val={len(tr&va)} | "
-              f"train∩test={len(tr&te)} | val∩test={len(va&te)} "
+        print(f"  Player overlap   : train∩val={len(tr & va)} | "
+              f"train∩test={len(tr & te)} | val∩test={len(va & te)} "
               f"(all should be 0)")
 
 
@@ -212,3 +212,6 @@ if __name__ == "__main__":
     ds = load_dataset(path)
     print()
     ds.summary()
+    print("\nPos weight for BCE:", ds.pos_weight())
+    print("Class weights     :", ds.class_weights())
+    print("n_features        :", ds.n_features)
