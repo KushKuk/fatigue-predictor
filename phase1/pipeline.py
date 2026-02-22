@@ -84,26 +84,35 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Phase 1 Pipeline")
-    parser.add_argument("--match_id",  type=int, default=DEFAULT_MATCH_ID)
-    parser.add_argument("--out_dir",   type=str, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--lookahead", type=int, default=DEFAULT_LOOKAHEAD)
-    parser.add_argument("--quiet",     action="store_true")
-    args = parser.parse_args()
 
-    df = run_pipeline(
-        match_id  = args.match_id,
-        out_dir   = args.out_dir,
-        lookahead = args.lookahead,
-        verbose   = not args.quiet,
-    )
+    from glob import glob
 
-    preview_cols = [
-        "player_id", "window_end_ts",
-        "event_rate_1m", "hi_intensity_rate_1m", "fatigue_index_1m",
-        "decision_latency_mean_1m", "error_rate_1m", "pass_accuracy_1m",
-        "composite_z", "drop_label", "future_drop", "risk_score",
-    ]
-    preview_cols = [c for c in preview_cols if c in df.columns]
-    print("\nSample output:")
-    print(df[preview_cols].dropna().head(5).to_string())
+    print("Running Phase 1 on ALL matches...\n")
+
+    parquet_files = glob("data/parquets/*.parquet")
+    print(f"Found {len(parquet_files)} matches")
+
+    all_outputs = []
+
+    for file in parquet_files:
+        match_id = int(os.path.basename(file).split("_")[1].split(".")[0])
+
+        print(f"\nProcessing match {match_id}")
+        df = run_pipeline(
+            match_id=match_id,
+            out_dir=DEFAULT_OUT_DIR,
+            lookahead=DEFAULT_LOOKAHEAD,
+            verbose=True,
+        )
+
+        all_outputs.append(df)
+
+    print("\nMerging all Phase 1 outputs...")
+
+    final_df = pd.concat(all_outputs, ignore_index=True)
+
+    final_path = os.path.join(DEFAULT_OUT_DIR, "phase1_all_matches.parquet")
+    final_df.to_parquet(final_path, index=False)
+
+    print(f"\nFinal merged Phase 1 dataset saved to: {final_path}")
+    print("Final shape:", final_df.shape)

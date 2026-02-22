@@ -107,6 +107,11 @@ def load_match_bundle(match_id: int) -> dict:
     Physical signals are derived from event-level data.
     """
     events = load_events(match_id)
+    import os
+
+    os.makedirs("data/parquets", exist_ok=True)
+    events.to_parquet(f"data/parquets/match_{match_id}.parquet", index=False)
+    print(f"Saved match {match_id} to data/parquets/")
 
     player_ids = events["player_id"].dropna().unique()
     n_players  = len(player_ids)
@@ -129,20 +134,19 @@ def load_match_bundle(match_id: int) -> dict:
 # Quick test
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    comps = list_available_competitions()
-    print(comps[["competition_id", "season_id", "competition_name"]].head(10))
-
     COMPETITION_ID = 11   # La Liga
-    SEASON_ID      = 90
-    matches = load_matches(COMPETITION_ID, SEASON_ID)
-    MATCH_ID = int(matches["match_id"].iloc[0])
-    print(f"\nLoading match {MATCH_ID} ...")
+    SEASON_ID = 90        # 2020-21 season
 
-    bundle = load_match_bundle(MATCH_ID)
-    ev = bundle["events"]
-    print("\nEvents shape:", ev.shape)
-    print("Columns:", ev.columns.tolist())
-    print("\nPlayer sample (non-null):")
-    print(ev.dropna(subset=["player_id"])[
-        ["player_id", "player_name", "team_name", "event_type", "x", "y", "time_seconds"]
-    ].head(8).to_string())
+    print("Fetching matches...")
+    matches = load_matches(COMPETITION_ID, SEASON_ID)
+
+    print(f"Total matches found: {len(matches)}")
+    print("Generating parquet files...\n")
+
+    for match_id in matches["match_id"]:
+        try:
+            load_match_bundle(int(match_id))
+        except Exception as e:
+            print(f"Skipped match {match_id}: {e}")
+
+    print("\nDataset generation complete.")
