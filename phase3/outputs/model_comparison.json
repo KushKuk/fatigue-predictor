@@ -1,0 +1,35 @@
+[
+  {
+    "name": "Logistic Regression",
+    "auc": 0.6329,
+    "avg_precision": 0.5074,
+    "f1": 0.0704,
+    "precision": 0.7143,
+    "recall": 0.037,
+    "brier": 0.2203,
+    "threshold": 0.5,
+    "early_detection_rate": 0.0222
+  },
+  {
+    "name": "LSTM",
+    "auc": 0.5337,
+    "avg_precision": 0.4101,
+    "f1": 0.4775,
+    "precision": 0.3471,
+    "recall": 0.7652,
+    "brier": 0.2631,
+    "threshold": 0.5,
+    "early_detection_rate": 0.8182
+  },
+  {
+    "name": "Transformer",
+    "auc": 0.5414,
+    "avg_precision": 0.4386,
+    "f1": 0.3946,
+    "precision": 0.3315,
+    "recall": 0.4876,
+    "brier": 0.2615,
+    "threshold": 0.5,
+    "early_detection_rate": 0.6612
+  }
+]

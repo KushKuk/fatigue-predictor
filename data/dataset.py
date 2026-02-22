@@ -29,8 +29,8 @@ NON_FEATURE_COLS = {
     "z_pass_acc", "z_error_rate", "z_sprint_rate", "composite_z",
 }
 
-TARGET_COL    = "future_drop"   # binary: drop in next N windows
-RISK_COL      = "risk_score"    # soft target for calibration
+TARGET_COL = "future_drop"   # binary: drop in next N windows
+RISK_COL   = "risk_score"    # soft target for calibration
 
 
 @dataclass
@@ -43,7 +43,11 @@ class FatigueDataset:
     y_test:  np.ndarray
     feature_names: list[str]
     scaler: StandardScaler
-    # soft risk scores (for calibration loss)
+    # Player IDs aligned to each split row (for player-aware sequence building)
+    player_ids_train: np.ndarray = field(default_factory=lambda: np.array([]))
+    player_ids_val:   np.ndarray = field(default_factory=lambda: np.array([]))
+    player_ids_test:  np.ndarray = field(default_factory=lambda: np.array([]))
+    # Soft risk scores (for calibration loss)
     r_train: np.ndarray = field(default_factory=lambda: np.array([]))
     r_val:   np.ndarray = field(default_factory=lambda: np.array([]))
     r_test:  np.ndarray = field(default_factory=lambda: np.array([]))
@@ -66,13 +70,34 @@ class FatigueDataset:
         n_neg = len(self.y_train) - n_pos
         return n_neg / max(n_pos, 1)
 
+    def summary(self) -> None:
+        """Print a quick data summary including player counts per split."""
+        print(f"  n_features       : {self.n_features}")
+        print(f"  Train rows       : {len(self.X_train)} "
+              f"| players: {np.unique(self.player_ids_train).size} "
+              f"| pos: {self.y_train.sum()}")
+        print(f"  Val rows         : {len(self.X_val)} "
+              f"| players: {np.unique(self.player_ids_val).size} "
+              f"| pos: {self.y_val.sum()}")
+        print(f"  Test rows        : {len(self.X_test)} "
+              f"| players: {np.unique(self.player_ids_test).size} "
+              f"| pos: {self.y_test.sum()}")
+        print(f"  pos_weight (BCE) : {self.pos_weight():.2f}")
+        # Confirm zero player overlap across splits
+        tr = set(self.player_ids_train.tolist())
+        va = set(self.player_ids_val.tolist())
+        te = set(self.player_ids_test.tolist())
+        print(f"  Player overlap   : train∩val={len(tr&va)} | "
+              f"train∩test={len(tr&te)} | val∩test={len(va&te)} "
+              f"(all should be 0)")
+
 
 def load_dataset(
     parquet_path: str,
-    val_size:  float = 0.15,
-    test_size: float = 0.15,
-    random_state: int = 42,
-    verbose: bool = True,
+    val_size:     float = 0.15,
+    test_size:    float = 0.15,
+    random_state: int   = 42,
+    verbose:      bool  = True,
 ) -> FatigueDataset:
     """
     Load Phase 1 parquet → clean → split → scale.
@@ -80,8 +105,8 @@ def load_dataset(
     Parameters
     ----------
     parquet_path : path to phase1_features_match*.parquet
-    val_size     : fraction of data for validation
-    test_size    : fraction of data for test
+    val_size     : fraction of players for validation
+    test_size    : fraction of players for test
     random_state : RNG seed
 
     Returns
@@ -109,12 +134,10 @@ def load_dataset(
     X = X.drop(columns=all_nan_cols)
     feat_cols = X.columns.tolist()
 
-    # Fill remaining NaNs: first with column median, then 0 for any still-NaN columns
+    # Fill remaining NaNs with column median, then 0 for still-NaN columns
     col_medians = X.median()
-    X = X.fillna(col_medians)
-    X = X.fillna(0.0)   # catches columns where median itself was NaN
+    X = X.fillna(col_medians).fillna(0.0)
 
-    # Final safety check
     assert not X.isna().any().any(), "NaNs remain after cleaning — check feature pipeline"
 
     y      = np.array(df[TARGET_COL].values, dtype=np.int64)
@@ -125,7 +148,7 @@ def load_dataset(
         print(f"[Dataset] Feature columns : {len(feat_cols)}")
         print(f"[Dataset] Class balance   : {dict(zip(*np.unique(y, return_counts=True)))}")
 
-    # ── Group-aware train / temp split ───────────────────────────────────────
+    # ── Group-aware train / temp split ────────────────────────────────────────
     gss_test = GroupShuffleSplit(
         n_splits=1,
         test_size=test_size + val_size,
@@ -152,8 +175,13 @@ def load_dataset(
     X_val,   y_val,   r_val   = X_arr[val_idx],   y[val_idx],   r[val_idx]
     X_test,  y_test,  r_test  = X_arr[test_idx],  y[test_idx],  r[test_idx]
 
+    # Player IDs aligned to each split (for player-aware sequence building)
+    pid_train = groups[train_idx]
+    pid_val   = groups[val_idx]
+    pid_test  = groups[test_idx]
+
     # ── Scale (fit on train only) ─────────────────────────────────────────────
-    scaler = StandardScaler()
+    scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_train).astype(np.float32)
     X_val   = scaler.transform(X_val).astype(np.float32)
     X_test  = scaler.transform(X_test).astype(np.float32)
@@ -169,18 +197,18 @@ def load_dataset(
         r_train=r_train, r_val=r_val, r_test=r_test,
         feature_names=feat_cols,
         scaler=scaler,
+        player_ids_train=pid_train,
+        player_ids_val=pid_val,
+        player_ids_test=pid_test,
     )
 
 
 # ── Quick test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
-    # dataset.py lives at: fatigue_predictor/data/dataset.py
-    # parquet lives at:    fatigue_predictor/phase1/outputs/...
     _root    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _default = os.path.join(_root, "phase1", "outputs", "phase1_features_match3773386.parquet")
     path = sys.argv[1] if len(sys.argv) > 1 else _default
     ds = load_dataset(path)
-    print("\nPos weight for BCE:", ds.pos_weight())
-    print("Class weights     :", ds.class_weights())
-    print("n_features        :", ds.n_features)
+    print()
+    ds.summary()
