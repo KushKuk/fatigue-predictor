@@ -1,0 +1,11 @@
+# Data
+statsbombpy>=1.16.0
+pandas>=2.0.0
+numpy>=1.26.0
+pyarrow>=14.0.0
+
+# Feature engineering
+scipy>=1.11.0
+
+# Utilities
+tqdm>=4.66.0
