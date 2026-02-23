@@ -182,17 +182,47 @@ def run_pipeline(
             lambda pid: player_names.get(float(pid), f"Player {pid:.0f}")
         )
 
-    # ── 6. Run simulation ─────────────────────────────────────────────────────
-    log(f"Running match simulation (speed={speed_factor}x) …")
+    # ── 6. Run simulation — write CSV live on every tick ─────────────────────
+    log(f"Running match simulation (speed={speed_factor}×) …")
+
+    csv_path   = os.path.join(out_dir, "simulation_results.csv")
+    _csv_header_written = [False]   # mutable cell for closure
 
     from inference.match_simulator import SimulationTick
 
     def _on_tick(tick: SimulationTick) -> None:
+        # RED console alert
         if tick.result.alert_level == "RED" and verbose:
             ts_m = int(tick.match_time_s // 60)
             ts_s = int(tick.match_time_s % 60)
             print(f"  🔴 [{ts_m:02d}:{ts_s:02d}] {tick.player_name:<28s} "
                   f"risk={tick.result.risk_score:.3f}")
+
+        # Write row to CSV immediately so dashboard can read live
+        row = {
+            "match_time_s":      tick.match_time_s,
+            "match_time_min":    tick.match_time_s / 60.0,
+            "player_id":         tick.player_id,
+            "player_name":       tick.player_name,
+            "risk_score":        tick.result.risk_score,
+            "lr_score":          tick.result.lr_score,
+            "lstm_score":        tick.result.lstm_score,
+            "transformer_score": tick.result.transformer_score,
+            "alert_level":       tick.result.alert_level,
+            "confidence_low":    tick.result.confidence_low,
+            "confidence_high":   tick.result.confidence_high,
+            "alert_fired":       tick.alert_fired,
+            "latency_ms":        tick.result.latency_ms,
+        }
+        write_header = not _csv_header_written[0]
+        pd.DataFrame([row]).to_csv(
+            csv_path, mode="a", header=write_header, index=False
+        )
+        _csv_header_written[0] = True
+
+    # Clear any existing CSV so we start fresh
+    if os.path.exists(csv_path):
+        os.remove(csv_path)
 
     sim = MatchSimulator(
         engine        = engine,
@@ -204,12 +234,10 @@ def run_pipeline(
     )
 
     ticks = sim.run(speed_factor=speed_factor, max_time_s=max_time_s, verbose=verbose)
-
-    # ── 7. Save results ───────────────────────────────────────────────────────
-    results_df = sim.summary_dataframe()
-    csv_path   = os.path.join(out_dir, "simulation_results.csv")
-    results_df.to_csv(csv_path, index=False)
     log(f"Results → {csv_path}")
+
+    # ── 7. Build summary dataframe from written CSV ───────────────────────────
+    results_df = pd.read_csv(csv_path)
 
     # Save feature names for dashboard SHAP panel
     feat_names_path = os.path.join(ROOT_DIR, "phase3", "outputs", "feature_names.json")

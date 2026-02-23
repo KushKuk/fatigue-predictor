@@ -28,7 +28,16 @@ import pandas as pd
 import streamlit as st
 
 # ── Path bootstrap ─────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent.parent
+# __file__ = fatigue_predictor/phase4/dashboard/dashboard.py
+# .parent   = fatigue_predictor/phase4/dashboard/
+# .parent.parent = fatigue_predictor/phase4/
+# .parent.parent.parent = fatigue_predictor/   ← project root
+# Walk up from this file until we find the folder that contains phase4/outputs/
+# Works regardless of whether dashboard.py is in phase4/dashboard/ or dashboard/
+_here = Path(__file__).resolve()
+ROOT  = _here.parent  # start one level up from dashboard.py
+while not (ROOT / "phase4" / "outputs").exists() and ROOT != ROOT.parent:
+    ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT))
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -138,7 +147,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Alert levels**")
     st.markdown("🟢 GREEN  < 0.40")
-    st.markdown("🟡 AMBER  0.40-0.65")
+    st.markdown("🟡 AMBER  0.40–0.65")
     st.markdown("🔴 RED    > 0.65")
 
     if st.button("🔄 Refresh data"):
@@ -154,10 +163,14 @@ st.markdown("---")
 df = load_sim_data()
 
 if df is None:
+    csv_path = ROOT / "phase4" / "outputs" / "simulation_results.csv"
     st.warning(
-        "No simulation data found. Run the Phase 4 pipeline first:\n\n"
-        "```\npython phase4/pipeline.py\n```"
+        f"No simulation data found.\n\n"
+        f"**Looking for:** `{csv_path}`\n\n"
+        f"Run the pipeline first:\n```\npython phase4/pipeline.py\n```\n\n"
+        f"Then click **Refresh data** in the sidebar."
     )
+    st.info(f"Dashboard ROOT resolved to: `{ROOT}`")
     st.stop()
 
 # ── KPI row ───────────────────────────────────────────────────────────────────
@@ -208,7 +221,7 @@ with col_left:
         """, unsafe_allow_html=True)
 
 with col_right:
-    st.markdown("### Recent Alerts")
+    st.markdown("### 📢 Recent Alerts")
     alerts = load_alerts()
     if alerts:
         for alert in reversed(alerts[-15:]):
@@ -294,7 +307,7 @@ if shap_data:
 # ── Model comparison ──────────────────────────────────────────────────────────
 comparison = load_comparison()
 if comparison:
-    st.markdown("### Model Comparison")
+    st.markdown("### 📊 Model Comparison")
     comp_df = pd.DataFrame(comparison).set_index("name")
     st.dataframe(comp_df.style.highlight_max(axis=0, color="#1a2a1a"), use_container_width=True)
 
