@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+import glob
 
 import numpy as np
 import pandas as pd
@@ -30,32 +31,27 @@ ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, BASE_DIR)
 
-from data.dataset               import load_dataset, FatigueDataset, NON_FEATURE_COLS
-from inference.inference_engine import InferenceEngine, _LRWrapper, _LSTMWrapper, _TransformerWrapper
-from inference.alert_manager    import AlertManager, file_handler
-from inference.match_simulator  import MatchSimulator
+from data.dataset                  import load_dataset, FatigueDataset, NON_FEATURE_COLS
+from inference.inference_engine    import InferenceEngine, _LRWrapper, _LSTMWrapper, _TransformerWrapper
+from inference.alert_manager       import AlertManager, file_handler
+from inference.match_simulator     import MatchSimulator
 
-DEFAULT_PARQUET   = os.path.join(ROOT_DIR, "phase1", "outputs", "phase1_features_match3773386.parquet")
-DEFAULT_OUT       = os.path.join(BASE_DIR, "outputs")
-DEFAULT_LR_PATH   = os.path.join(ROOT_DIR, "phase2", "outputs", "lr_baseline.pkl")
-DEFAULT_LSTM_PATH = os.path.join(ROOT_DIR, "phase2", "outputs", "lstm_baseline.pt")
-DEFAULT_TF_PATH   = os.path.join(ROOT_DIR, "phase3", "outputs", "transformer.pt")
+DEFAULT_PARQUET  = os.path.join(ROOT_DIR, "phase1", "outputs", "phase1_features_match3773386.parquet")
+DEFAULT_OUT      = os.path.join(BASE_DIR, "outputs")
+DEFAULT_LR_PATH  = os.path.join(ROOT_DIR, "phase2", "outputs", "lr_baseline.pkl")
+DEFAULT_LSTM_PATH= os.path.join(ROOT_DIR, "phase2", "outputs", "lstm_baseline.pt")
+DEFAULT_TF_PATH  = os.path.join(ROOT_DIR, "phase3", "outputs", "transformer.pt")
 
 
-def _load_engine(
-    ds:           FatigueDataset,
-    lr_path:      str,
-    lstm_path:    str,
-    tf_path:      str,
-    lstm_seq_len: int,
-    tf_seq_len:   int,
-    verbose:      bool,
-) -> InferenceEngine:
+def _load_engine(ds: FatigueDataset, lr_path: str, lstm_path: str, tf_path: str,
+                 lstm_seq_len: int, tf_seq_len: int, verbose: bool) -> InferenceEngine:
     """Load all three model components into the InferenceEngine."""
-    import pickle
-    import torch
-    from models.lstm_baseline import FatigueLSTM
-    from models.transformer   import FatigueTransformer
+    import pickle, torch, warnings
+    from models.lstm_baseline  import FatigueLSTM
+    from models.transformer    import FatigueTransformer
+
+    # Silence torch.load FutureWarning — we trust our own saved checkpoints
+    warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 
     if verbose:
         print("[Engine] Loading Logistic Regression …")
@@ -65,18 +61,49 @@ def _load_engine(
 
     if verbose:
         print("[Engine] Loading LSTM …")
-    lstm_sd    = torch.load(lstm_path, map_location="cpu")
-    lstm_model = FatigueLSTM(n_features=ds.n_features)
-    lstm_model.load_state_dict(lstm_sd)
+    lstm_sd = torch.load(lstm_path, map_location="cpu", weights_only=False)
+    # LSTM checkpoint may be raw state_dict or wrapped — handle both
+    if isinstance(lstm_sd, dict) and "state_dict" in lstm_sd:
+        lstm_cfg = lstm_sd.get("config", {})
+        lstm_cfg["n_features"] = ds.n_features
+        lstm_model = FatigueLSTM(**lstm_cfg)
+        lstm_model.load_state_dict(lstm_sd["state_dict"])
+    else:
+        lstm_model = FatigueLSTM(n_features=ds.n_features)
+        lstm_model.load_state_dict(lstm_sd)
     lstm_w = _LSTMWrapper(lstm_model, seq_len=lstm_seq_len)
 
     if verbose:
         print("[Engine] Loading Transformer …")
-    ckpt                 = torch.load(tf_path, map_location="cpu")
-    tf_cfg               = ckpt.get("config", {})
-    tf_cfg["n_features"] = ds.n_features
-    tf_model             = FatigueTransformer(**tf_cfg)
-    tf_model.load_state_dict(ckpt["state_dict"])
+    ckpt = torch.load(tf_path, map_location="cpu", weights_only=False)
+    sd   = ckpt["state_dict"]
+
+    # Infer architecture from state dict keys — robust against incomplete configs
+    n_layers = sum(1 for k in sd if k.startswith("blocks.") and k.endswith(".norm1.weight"))
+    d_model  = int(sd["norm.weight"].shape[0])
+    ffn_dim  = int(sd["blocks.0.ffn.0.weight"].shape[0])
+    n_heads  = int(ckpt.get("config", {}).get("n_heads", 4))
+    survival = bool(ckpt.get("config", {}).get("survival", False))
+    dropout  = float(ckpt.get("config", {}).get("dropout", 0.2))
+    max_seq  = int(sd["pos_enc.pe.weight"].shape[0]) - 1
+
+    tf_cfg: dict = {
+        "n_features":  ds.n_features,
+        "d_model":     d_model,
+        "n_heads":     n_heads,
+        "n_layers":    n_layers,
+        "ffn_dim":     ffn_dim,
+        "dropout":     dropout,
+        "max_seq_len": max_seq,
+        "survival":    survival,
+    }
+
+    if verbose:
+        print(f"  Inferred config: n_layers={n_layers}, d_model={d_model}, "
+              f"ffn_dim={ffn_dim}, n_heads={n_heads}")
+
+    tf_model = FatigueTransformer(**tf_cfg)
+    tf_model.load_state_dict(sd)
     tf_w = _TransformerWrapper(tf_model, seq_len=tf_seq_len)
 
     return InferenceEngine(
@@ -90,17 +117,17 @@ def _load_engine(
 
 
 def run_pipeline(
-    parquet_path: str,
-    out_dir:      str,
-    lr_path:      str,
-    lstm_path:    str,
-    tf_path:      str,
-    speed_factor: float        = 300.0,
-    max_time_s:   float | None = None,
-    lstm_seq_len: int          = 10,
-    tf_seq_len:   int          = 16,
-    cooldown_s:   float        = 60.0,
-    verbose:      bool         = True,
+    parquet_path:  str,
+    out_dir:       str,
+    lr_path:       str,
+    lstm_path:     str,
+    tf_path:       str,
+    speed_factor:  float = 300.0,
+    max_time_s:    float | None = None,
+    lstm_seq_len:  int   = 10,
+    tf_seq_len:    int   = 16,
+    cooldown_s:    float = 60.0,
+    verbose:       bool  = True,
 ) -> pd.DataFrame:
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
@@ -123,50 +150,40 @@ def run_pipeline(
 
     # ── 3. Load inference engine ──────────────────────────────────────────────
     log("Loading models into InferenceEngine …")
-    engine = _load_engine(
-        ds, lr_path, lstm_path, tf_path, lstm_seq_len, tf_seq_len, verbose
-    )
+    engine = _load_engine(ds, lr_path, lstm_path, tf_path,
+                          lstm_seq_len, tf_seq_len, verbose)
 
     # ── 4. Build alert manager ────────────────────────────────────────────────
     alert_log_path = os.path.join(out_dir, "alerts.jsonl")
-    alert_mgr      = AlertManager(cooldown_s=cooldown_s, escalation_windows=2)
+    alert_mgr = AlertManager(cooldown_s=cooldown_s, escalation_windows=2)
     alert_mgr.register_handler(file_handler(alert_log_path))
     log(f"Alert log → {alert_log_path}")
 
     # ── 5. Load raw features ──────────────────────────────────────────────────
     features_df = pd.read_parquet(parquet_path)
-    feat_cols   = [c for c in features_df.columns if c not in NON_FEATURE_COLS]
+
+    # Use EXACTLY the same feature columns the scaler was fit on (39 cols, not 41)
+    feat_cols = ds.feature_names
 
     # Build player name map from events if available
     player_names: dict[float, str] = {}
     try:
         from data.data_loader import load_events
-        match_id = (
-            int(features_df["match_id"].iloc[0])
-            if "match_id" in features_df.columns
-            else 3773386
-        )
-        events = load_events(match_id)
-        pmap   = (
-            events.dropna(subset=["player_id", "player_name"])
-                  .groupby("player_id")["player_name"]
-                  .first()
-        )
-        # Cast key through str before float: pmap.items() yields (Hashable, str)
-        # and float() does not accept Hashable directly per Pyright's type stubs.
+        match_id = int(features_df["match_id"].iloc[0]) if "match_id" in features_df.columns else 3773386
+        events   = load_events(match_id)
+        pmap     = events.dropna(subset=["player_id", "player_name"]) \
+                         .groupby("player_id")["player_name"].first()
         player_names = {float(str(k)): str(v) for k, v in pmap.items()}
     except Exception:
         pass
 
     if "player_name" not in features_df.columns:
         features_df["player_name"] = features_df["player_id"].map(
-            # Same str() cast for the lambda argument — pid is typed Hashable
-            # by pandas .map(), so float(str(pid)) is required for type safety.
-            lambda pid: player_names.get(float(str(pid)), f"Player {pid:.0f}")
+            lambda pid: player_names.get(float(pid), f"Player {pid:.0f}")
         )
 
     # ── 6. Run simulation ─────────────────────────────────────────────────────
-    log(f"Running match simulation (speed={speed_factor}×) …")
+    log(f"Running match simulation (speed={speed_factor}x) …")
 
     from inference.match_simulator import SimulationTick
 
@@ -174,10 +191,8 @@ def run_pipeline(
         if tick.result.alert_level == "RED" and verbose:
             ts_m = int(tick.match_time_s // 60)
             ts_s = int(tick.match_time_s % 60)
-            print(
-                f"  🔴 [{ts_m:02d}:{ts_s:02d}] {tick.player_name:<28s} "
-                f"risk={tick.result.risk_score:.3f}"
-            )
+            print(f"  🔴 [{ts_m:02d}:{ts_s:02d}] {tick.player_name:<28s} "
+                  f"risk={tick.result.risk_score:.3f}")
 
     sim = MatchSimulator(
         engine        = engine,
@@ -224,19 +239,19 @@ def run_pipeline(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 4 — Real-time Inference Pipeline")
-    parser.add_argument("--parquet",      type=str,   default=DEFAULT_PARQUET)
-    parser.add_argument("--out_dir",      type=str,   default=DEFAULT_OUT)
-    parser.add_argument("--lr_path",      type=str,   default=DEFAULT_LR_PATH)
-    parser.add_argument("--lstm_path",    type=str,   default=DEFAULT_LSTM_PATH)
-    parser.add_argument("--tf_path",      type=str,   default=DEFAULT_TF_PATH)
-    parser.add_argument("--speed",        type=float, default=300.0,
-                        help="Simulation speed multiplier (300 = 5 min replay per sec)")
-    parser.add_argument("--max_time",     type=float, default=None,
+    parser.add_argument("--parquet",       type=str,  default=DEFAULT_PARQUET)
+    parser.add_argument("--out_dir",       type=str,  default=DEFAULT_OUT)
+    parser.add_argument("--lr_path",       type=str,  default=DEFAULT_LR_PATH)
+    parser.add_argument("--lstm_path",     type=str,  default=DEFAULT_LSTM_PATH)
+    parser.add_argument("--tf_path",       type=str,  default=DEFAULT_TF_PATH)
+    parser.add_argument("--speed",         type=float,default=300.0,
+                        help="Simulation speed multiplier (300=5min replay per sec)")
+    parser.add_argument("--max_time",      type=float,default=None,
                         help="Stop simulation after N match seconds")
-    parser.add_argument("--lstm_seq_len", type=int,   default=10)
-    parser.add_argument("--tf_seq_len",   type=int,   default=16)
-    parser.add_argument("--cooldown",     type=float, default=60.0)
-    parser.add_argument("--quiet",        action="store_true")
+    parser.add_argument("--lstm_seq_len",  type=int,  default=10)
+    parser.add_argument("--tf_seq_len",    type=int,  default=16)
+    parser.add_argument("--cooldown",      type=float,default=60.0)
+    parser.add_argument("--quiet",         action="store_true")
     args = parser.parse_args()
 
     run_pipeline(

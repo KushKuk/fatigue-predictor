@@ -23,13 +23,13 @@
   },
   {
     "name": "Transformer",
-    "auc": 0.7794,
-    "avg_precision": 0.6395,
-    "f1": 0.5572,
-    "precision": 0.55,
-    "recall": 0.5645,
-    "brier": 0.1677,
+    "auc": 0.7866,
+    "avg_precision": 0.6438,
+    "f1": 0.5609,
+    "precision": 0.4786,
+    "recall": 0.6772,
+    "brier": 0.1929,
     "threshold": 0.5,
-    "early_detection_rate": 0.5645
+    "early_detection_rate": 0.6897
   }
 ]

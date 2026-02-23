@@ -18,11 +18,8 @@ Objective: maximise validation AUC.
 
 from __future__ import annotations
 
-import os
-import sys
 import optuna
 import numpy as np
-import torch
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 

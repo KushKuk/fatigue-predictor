@@ -15,18 +15,10 @@ Design choices:
     - Learnable positional encoding (works better for short sequences)
     - Pre-norm (LayerNorm before attention) for stable training
     - Survival head optional: estimates time-to-drop in minutes
-
-IMPORTANT — player-aware sequences:
-    TransformerDataset accepts an optional player_ids array.
-    When provided, sliding windows are built *within* each player's
-    rows only — never crossing player boundaries.  Always pass
-    player_ids to avoid mixing timelines from different players.
 """
 
 from __future__ import annotations
-
 import os
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -54,10 +46,10 @@ class PreNormTransformerBlock(nn.Module):
     """Single Transformer block with pre-LayerNorm (more stable training)."""
     def __init__(
         self,
-        d_model: int,
-        n_heads: int,
-        ffn_dim: int,
-        dropout: float,
+        d_model:   int,
+        n_heads:   int,
+        ffn_dim:   int,
+        dropout:   float,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -74,9 +66,11 @@ class PreNormTransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm attention
         normed = self.norm1(x)
         attn_out, _ = self.attn(normed, normed, normed)
         x = x + attn_out
+        # Pre-norm FFN
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -176,23 +170,29 @@ class FatigueTransformer(nn.Module):
         """
         B = x.size(0)
 
-        x = self.input_proj(x)                       # (B, T, D)
+        # Project input features
+        x = self.input_proj(x)              # (B, T, D)
 
-        cls = self.cls_token.expand(B, -1, -1)       # (B, 1, D)
-        x   = torch.cat([cls, x], dim=1)             # (B, T+1, D)
+        # Prepend CLS token
+        cls = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+        x   = torch.cat([cls, x], dim=1)         # (B, T+1, D)
 
+        # Positional encoding
         x = self.pos_enc(x)
 
+        # Transformer blocks
         for block in self.blocks:
             x = block(x)
 
         x = self.norm(x)
 
-        cls_repr = self.dropout(x[:, 0, :])          # (B, D)
-        logits   = self.cls_head(cls_repr).squeeze(-1)  # (B,)
+        # CLS token representation
+        cls_repr = self.dropout(x[:, 0, :])      # (B, D)
+
+        logits = self.cls_head(cls_repr).squeeze(-1)   # (B,)
 
         if self.survival:
-            t_pred = self.surv_head(cls_repr).squeeze(-1)  # (B,)
+            t_pred = self.surv_head(cls_repr).squeeze(-1)   # (B,)
             return logits, t_pred
 
         return logits
@@ -202,21 +202,8 @@ class FatigueTransformer(nn.Module):
 
 class TransformerDataset(torch.utils.data.Dataset):
     """
-    Sliding-window sequence dataset for the Transformer.
-
-    When player_ids is provided (strongly recommended), windows are
-    built within each player's contiguous block of rows only.
-    This prevents sequences from spanning across player boundaries,
-    which would mix unrelated timelines and corrupt temporal signal.
-
-    Parameters
-    ----------
-    X          : (N, F) feature array
-    y          : (N,)   label array
-    seq_len    : number of timesteps per sequence
-    stride     : step between consecutive windows (default 1)
-    player_ids : (N,) integer player identifier per row.
-                 Pass ds.player_ids_train / _val / _test from FatigueDataset.
+    Sliding window sequences for the Transformer.
+    If player_ids is provided, windows never cross player boundaries.
     """
     def __init__(
         self,
@@ -229,31 +216,19 @@ class TransformerDataset(torch.utils.data.Dataset):
         self.seqs:   list[np.ndarray] = []
         self.labels: list[int]        = []
 
-        if player_ids is None:
-            # Fallback: treat entire array as one block (legacy behaviour).
-            # WARNING: sequences will cross player boundaries if X contains
-            # rows from multiple players. Always pass player_ids.
-            groups = [np.arange(len(X))]
-        else:
+        if player_ids is not None:
+            # Build sequences only within each player's contiguous block
             unique_players = np.unique(player_ids)
-            groups = [np.where(player_ids == pid)[0] for pid in unique_players]
-
-        n_cross_boundary = 0
-        for idx in groups:
-            X_p = X[idx]
-            y_p = y[idx]
-            n   = len(X_p)
-            if n < seq_len:
-                # Player has fewer rows than seq_len — skip entirely.
-                n_cross_boundary += 1
-                continue
-            for start in range(0, n - seq_len + 1, stride):
-                self.seqs.append(X_p[start : start + seq_len])
-                self.labels.append(int(y_p[start + seq_len - 1]))
-
-        if n_cross_boundary > 0 and player_ids is not None:
-            print(f"[TransformerDataset] Skipped {n_cross_boundary} player(s) "
-                  f"with fewer than {seq_len} rows.")
+            for pid in unique_players:
+                idx = np.where(player_ids == pid)[0]
+                Xp, yp = X[idx], y[idx]
+                for start in range(0, len(Xp) - seq_len + 1, stride):
+                    self.seqs.append(Xp[start : start + seq_len])
+                    self.labels.append(int(yp[start + seq_len - 1]))
+        else:
+            for start in range(0, len(X) - seq_len + 1, stride):
+                self.seqs.append(X[start : start + seq_len])
+                self.labels.append(int(y[start + seq_len - 1]))
 
     def __len__(self) -> int:
         return len(self.seqs)
@@ -268,19 +243,13 @@ def make_transformer_loaders(
     X_train: np.ndarray, y_train: np.ndarray,
     X_val:   np.ndarray, y_val:   np.ndarray,
     X_test:  np.ndarray, y_test:  np.ndarray,
-    seq_len:           int                = 16,
-    batch_size:        int                = 64,
-    stride:            int                = 1,
-    player_ids_train:  np.ndarray | None  = None,
-    player_ids_val:    np.ndarray | None  = None,
-    player_ids_test:   np.ndarray | None  = None,
+    seq_len:            int            = 16,
+    batch_size:         int            = 64,
+    stride:             int            = 1,
+    player_ids_train:   np.ndarray | None = None,
+    player_ids_val:     np.ndarray | None = None,
+    player_ids_test:    np.ndarray | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    Build train / val / test DataLoaders with player-aware sequence windows.
-
-    Always pass player_ids_* from FatigueDataset to avoid cross-player
-    sequence contamination.
-    """
     train_ds = TransformerDataset(X_train, y_train, seq_len, stride, player_ids_train)
     val_ds   = TransformerDataset(X_val,   y_val,   seq_len, stride, player_ids_val)
     test_ds  = TransformerDataset(X_test,  y_test,  seq_len, stride, player_ids_test)
@@ -295,25 +264,31 @@ def make_transformer_loaders(
 # ── Save / Load ────────────────────────────────────────────────────────────────
 
 def save_transformer(model: FatigueTransformer, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Infer ffn_dim and n_layers from actual model weights
+    ffn_dim  = model.blocks[0].ffn[0].out_features if model.blocks else 256
+    n_layers = len(model.blocks)
+    n_heads  = model.blocks[0].attn.num_heads if model.blocks else 4
+    dropout  = model.dropout.p
+
     torch.save({
         "state_dict": model.state_dict(),
         "config": {
-            "n_features": model.input_proj[0].in_features,
-            "d_model":    model.d_model,
-            "survival":   model.survival,
+            "n_features":  model.input_proj[0].in_features,
+            "d_model":     model.d_model,
+            "n_heads":     n_heads,
+            "n_layers":    n_layers,
+            "ffn_dim":     ffn_dim,
+            "dropout":     dropout,
+            "survival":    model.survival,
         },
     }, path)
     print(f"[Transformer] Saved → {path}")
 
 
-def load_transformer(
-    path: str,
-    n_features: int,
-    **kwargs: int | float | bool,
-) -> FatigueTransformer:
-    ckpt  = torch.load(path, map_location="cpu")
-    cfg   = ckpt.get("config", {})
+def load_transformer(path: str, n_features: int, **kwargs: int | float | bool) -> FatigueTransformer:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    cfg  = dict(ckpt.get("config", {}))
     cfg.update(kwargs)
     cfg["n_features"] = n_features
     model = FatigueTransformer(**cfg)
